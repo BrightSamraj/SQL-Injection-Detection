@@ -10,7 +10,7 @@ import pandas as pd
 LOG_FILE = 'security.log'
 
 # --- 1. Logger Setup ---
-# Clear the log file for a clean demo each time the app reruns
+# Clear the log file for a clean demo each time the app runs
 if os.path.exists(LOG_FILE):
     os.remove(LOG_FILE)
 
@@ -21,23 +21,20 @@ logging.basicConfig(
     format='%(asctime)s - %(levelname)s - %(message)s'
 )
 
-# --- 2. Database Setup ---
-@st.cache_resource
-def setup_database():
+# --- 2. Database Setup (Corrected) ---
+
+def init_database():
     """
     Creates an in-memory database, a 5-column table,
     and populates it with 20 rows.
-    
-    We use @st.cache_resource to ensure the database
-    persists across Streamlit reruns.
+    This function is called ONLY ONCE per session.
     """
     st.toast("Creating new in-memory database...")
-    # Use :memory: to create a database that exists only in RAM
     # check_same_thread=False is needed for Streamlit's threading
     conn = sqlite3.connect(':memory:', check_same_thread=False)
     cursor = conn.cursor()
     
-    # 1. Create the table with 5 columns
+    # 1. Create the table
     cursor.execute('''
     CREATE TABLE users (
         id INTEGER PRIMARY KEY,
@@ -48,7 +45,7 @@ def setup_database():
     )
     ''')
 
-    # 2. Insert 20 rows of dummy data
+    # 2. Insert 20 rows
     roles = ['user', 'admin', 'guest']
     known_user = 'test_user'
     known_pass = 'ValidPassword123'
@@ -73,9 +70,25 @@ def setup_database():
     conn.commit()
     return conn, known_user, known_pass
 
+def get_db_session():
+    """
+    Uses st.session_state to get or create the database connection.
+    This replaces @st.cache_resource and fixes the error.
+    """
+    if 'db_conn' not in st.session_state:
+        # Create the connection and store it in the session
+        st.session_state.db_conn, st.session_state.test_user, st.session_state.test_pass = init_database()
+    
+    # Return the stored values
+    return st.session_state.db_conn, st.session_state.test_user, st.session_state.test_pass
+
 def get_all_users(conn):
     """Helper function to fetch all users as a Pandas DataFrame."""
-    return pd.read_sql_query("SELECT id, username, password, role FROM users", conn)
+    try:
+        return pd.read_sql_query("SELECT id, username, password, role FROM users", conn)
+    except Exception as e:
+        st.error(f"Error reading database: {e}. The database might have been dropped.")
+        return pd.DataFrame()
 
 # --- 3. The "Scanner" (Detection Feature) ---
 def is_valid_input(input_string, field_name):
@@ -83,8 +96,6 @@ def is_valid_input(input_string, field_name):
     This is our "Python Scanner" (Input Validation).
     It checks if the input matches a safe pattern (alphanumeric + underscore).
     """
-    # This RegEx pattern only allows letters, numbers, and underscores,
-    # and a length between 4 and 20 characters.
     if re.fullmatch(r'^[a-zA-Z0-9_]{4,20}$', input_string):
         return True
     else:
@@ -98,7 +109,6 @@ def is_valid_input(input_string, field_name):
 def vulnerable_login(conn, username, password):
     """
     A DANGEROUSLY vulnerable login function.
-    It builds a query by pasting user input directly.
     """
     st.info(f"Attempting VULNERABLE login...")
     
@@ -108,7 +118,8 @@ def vulnerable_login(conn, username, password):
     
     try:
         cursor = conn.cursor()
-        cursor.execute(query) # The flaw is here
+        # Using executescript to allow stacked queries (e.g., DROP TABLE)
+        cursor.executescript(query) 
         user = cursor.fetchone()
         
         if user:
@@ -123,7 +134,6 @@ def vulnerable_login(conn, username, password):
 def secure_login(conn, username, password):
     """
     A SECURE login function.
-    It uses 1. Validation (Detection) and 2. Parameterized Queries (Prevention).
     """
     st.info(f"Attempting SECURE login...")
     
@@ -141,7 +151,6 @@ def secure_login(conn, username, password):
     try:
         cursor = conn.cursor()
         # The fix is here: Pass the data as a separate tuple.
-        # The database engine safely handles the data, preventing execution.
         cursor.execute(query, (username, password)) 
         user = cursor.fetchone()
         
@@ -158,13 +167,14 @@ st.set_page_config(page_title="SQL Injection Demo", layout="wide", initial_sideb
 st.title("🛡️ SQL Injection: Attack vs. Defense Demo")
 st.write("This app demonstrates how SQL Injection attacks work and how to prevent them using a live in-memory database.")
 
-# Setup DB and get test credentials
-conn, test_user, test_pass = setup_database()
+# Get the persistent DB session
+conn, test_user, test_pass = get_db_session()
 
 st.info(f"Database is ready. A test user exists: **Username:** `{test_user}` | **Password:** `{test_pass}`")
 
-# Define the attack payload
-attack_payload = "' OR '1'='1"
+# Define the attack payloads
+attack_payload_bypass = "' OR '1'='1"
+attack_payload_drop = "'; DROP TABLE users; --"
 
 # Create tabs for the demo
 tab_attack, tab_defense, tab_db, tab_log = st.tabs([
@@ -179,33 +189,38 @@ with tab_attack:
     st.header("💥 The Attack Scenario")
     st.warning("This login form is **intentionally vulnerable**. It builds the SQL query using f-strings, which is dangerous!")
     
-    st.subheader("Try the Attack")
-    st.write(f"We will use the following payload for the password: `{attack_payload}`")
-    st.write("This payload is designed to make the `WHERE` clause always true, bypassing the password check.")
-    
-    with st.form("vulnerable_form"):
-        v_username = st.text_input("Username", value=test_user)
-        v_password = st.text_input("Password", value=attack_payload)
-        v_submitted = st.form_submit_button("Attempt HACKED Login")
-        
-    if v_submitted:
-        vulnerable_login(conn, v_username, v_password)
+    col1, col2 = st.columns(2)
+    with col1:
+        st.subheader("Try Attack 1: Login Bypass")
+        st.write(f"Uses the payload: `{attack_payload_bypass}`")
+        with st.form("vulnerable_form_1"):
+            v1_username = st.text_input("Username", value=test_user, key="v1_user")
+            v1_password = st.text_input("Password", value=attack_payload_bypass, key="v1_pass")
+            v1_submitted = st.form_submit_button("Attempt Bypass Attack")
+        if v1_submitted:
+            vulnerable_login(conn, v1_username, v1_password)
+            
+    with col2:
+        st.subheader("Try Attack 2: Drop Table")
+        st.write(f"Uses the payload: `{attack_payload_drop}`")
+        with st.form("vulnerable_form_2"):
+            v2_username = st.text_input("Username", value="", key="v2_user")
+            v2_password = st.text_input("Password", value=attack_payload_drop, key="v2_pass")
+            v2_submitted = st.form_submit_button("Attempt Drop Table Attack")
+        if v2_submitted:
+            vulnerable_login(conn, v2_username, v2_password)
 
 # --- Tab 2: Defense ---
 with tab_defense:
     st.header("🛡️ The Defense Scenario")
-    st.success("This form is **SECURE**. It uses two key techniques:")
-    st.markdown("""
-        1.  **Input Validation (Our "Scanner"):** Rejects input with suspicious characters.
-        2.  **Parameterized Queries (The "Cure"):** Treats all input as data, never as executable code.
-    """)
+    st.success("This form is **SECURE**. It uses **Input Validation** and **Parameterized Queries**.")
     
-    st.subheader("Attempt 1: Try the SAME Attack")
-    st.write(f"We will use the same malicious payload: `{attack_payload}`")
+    st.subheader("Attempt 1: Try the Bypass Attack")
+    st.write(f"We will use the same malicious payload: `{attack_payload_bypass}`")
 
     with st.form("secure_form_attack"):
         s_username_att = st.text_input("Username", value=test_user, key="s_user_1")
-        s_password_att = st.text_input("Password", value=attack_payload, key="s_pass_1")
+        s_password_att = st.text_input("Password", value=attack_payload_bypass, key="s_pass_1")
         s_submitted_att = st.form_submit_button("Attempt SECURE Login (with attack)")
         
     if s_submitted_att:
